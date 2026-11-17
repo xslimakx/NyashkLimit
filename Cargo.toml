@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["plugins/nyashklimit", "xtask"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+
+[patch."https://github.com/robbert-vdh/nih-plug.git"]
+nih_plug = { path = "vendor/nih_plug" }
+
+[patch."https://github.com/RustAudio/baseview.git"]
+baseview = { path = "vendor/baseview" }
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+codegen-units = 1
+debug = false
+strip = "symbols"
