@@ -9,7 +9,7 @@ use nih_plug_egui::{
 };
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::presets::PRESETS;
 use crate::{Column, DitherParam, LimitParams, Meters, OsParam, ShapingParam, StyleParam, UiSettings, COL_SECS};
@@ -278,6 +278,11 @@ struct Gui {
     preset: usize,
     gain_raw: f32,
     custom_target: String,
+    /// smooth scrolling: when the history last grew
+    hist_written: u64,
+    hist_t: Instant,
+    /// headroom shown above 0 dB (eases with the input level)
+    head_sm: f32,
 }
 
 fn snapshot(params: &LimitParams) -> Vec<f32> {
@@ -347,41 +352,6 @@ fn faded_line(painter: &egui::Painter, x0: f32, pts: Vec<Pos2>, st: Stroke) {
     }
 }
 
-/// A level trace as one connected area (vertical gradient), optionally with a rim line on top.
-/// Values at or below `floor` are gaps.
-#[allow(clippy::too_many_arguments)]
-fn area(painter: &egui::Painter, x0: f32, v: &[f32], floor: f32, to_y: &dyn Fn(f32) -> f32, bottom: f32, hi: Color32, lo: Color32, rim: Option<Stroke>) {
-    let mut mesh = egui::Mesh::default();
-    let uv = egui::epaint::WHITE_UV;
-    let mut prev = false;
-    let mut line: Vec<Pos2> = vec![];
-    let mut lines: Vec<Vec<Pos2>> = vec![];
-    for (px, val) in v.iter().enumerate() {
-        let x = x0 + px as f32;
-        let on = *val > floor;
-        if on {
-            let y = to_y(*val);
-            let base = mesh.vertices.len() as u32;
-            let f = edge_fade(px);
-            mesh.vertices.push(egui::epaint::Vertex { pos: Pos2::new(x, y), uv, color: hi.gamma_multiply(f) });
-            mesh.vertices.push(egui::epaint::Vertex { pos: Pos2::new(x, bottom), uv, color: lo.gamma_multiply(f) });
-            if prev {
-                mesh.indices.extend_from_slice(&[base - 2, base, base + 1, base - 2, base + 1, base - 1]);
-            }
-            line.push(Pos2::new(x, y));
-        } else if !line.is_empty() {
-            lines.push(std::mem::take(&mut line));
-        }
-        prev = on;
-    }
-    lines.push(line);
-    painter.add(egui::Shape::mesh(mesh));
-    if let Some(st) = rim {
-        for l in lines.into_iter().filter(|l| l.len() > 1) {
-            faded_line(painter, x0, l, st);
-        }
-    }
-}
 
 /// Soft round glow (radial gradient to transparent), for the backdrop behind the glass.
 fn glow(painter: &egui::Painter, c: Pos2, r: f32, col: Color32) {
@@ -572,7 +542,7 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
     let size_state = editor_state.clone();
     create_egui_editor(
         editor_state,
-        Gui { gr_lv: 0.0, out_lv: [0.0; 2], out_hold: [-200.0; 2], hold_t: [0.0; 2], undo: vec![], redo: vec![], last_snap: vec![], ab: [None, None], ab_cur: 0, preset: 0, gain_raw: 0.0, custom_target: String::new() },
+        Gui { gr_lv: 0.0, out_lv: [0.0; 2], out_hold: [-200.0; 2], hold_t: [0.0; 2], undo: vec![], redo: vec![], last_snap: vec![], ab: [None, None], ab_cur: 0, preset: 0, gain_raw: 0.0, custom_target: String::new(), hist_written: 0, hist_t: Instant::now(), head_sm: 0.0 },
         |ctx, _| {
             let mut v = egui::Visuals::dark();
             v.panel_fill = BG;
@@ -832,15 +802,29 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
                     let dr = rect(dx, top, dw, main_h);
                     glass(&painter, dr, true);
                     let g = Rect::from_min_max(Pos2::new(dr.left() + 46.0, dr.top() + 30.0), Pos2::new(dr.right() - 16.0, dr.bottom() - 30.0));
-                    let ypos = |db: f32| g.bottom() - g.height() * scale_pos(scale, db);
-                    // gain reduction hangs from the top: 0 dB GR at the top, same dB-per-pixel as the
-                    // upper part of the scale
-                    let gr_y = |gr: f32| g.top() + (ypos(-gr) - ypos(0.0));
+                    // the scale, plus headroom above 0 dB when the input (with Gain) goes over it, so a
+                    // hot input keeps its real shape instead of a flat line at the top
+                    let k_top = scale_pos(scale, 0.0) - scale_pos(scale, -1.0);
+                    let head = st.head_sm;
+                    let base_h = g.height() / (1.0 + head * k_top);
+                    let ypos = |db: f32| {
+                        if db <= 0.0 {
+                            g.bottom() - base_h * scale_pos(scale, db)
+                        } else {
+                            g.bottom() - base_h * (1.0 + db.min(head) * k_top)
+                        }
+                    };
                     let disp_on = ui_set.display < 4;
-                    for t in scale_ticks(scale).into_iter().filter(|_| disp_on) {
+                    let mut ticks = scale_ticks(scale);
+                    let mut hd = 3.0;
+                    while hd <= head + 0.01 {
+                        ticks.push(hd);
+                        hd += if head > 12.0 { 6.0 } else { 3.0 };
+                    }
+                    for t in ticks.into_iter().filter(|_| disp_on) {
                         let y = ypos(t);
                         painter.hline(g.left()..=g.right(), y, Stroke::new(1.0_f32, Color32::from_rgb(0x1f, 0x15, 0x23)));
-                        let lab = k_label(scale, t).unwrap_or_else(|| format!("{t:.0}"));
+                        let lab = if t > 0.0 { format!("+{t:.0}") } else { k_label(scale, t).unwrap_or_else(|| format!("{t:.0}")) };
                         painter.text(Pos2::new(g.left() - 6.0, y), Align2::RIGHT_CENTER, lab, mono(9.0), DIM);
                     }
                     // the ceiling
@@ -852,161 +836,166 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
                     }
                     let ceil_txt = format!("ceiling {:.1}{}", ceil_db, if p.true_peak.value() { " dBTP" } else { " dB" });
 
-                    // history: one value per pixel column
+                    // history: columns anchored to their absolute index (groups of 2^k columns
+                    // where they are narrower than ~1.5 px), placed at fractional x and scrolled
+                    // smoothly between audio blocks - the picture moves, it is not re-sampled
+                    // every frame (that was the jitter of the waves and the GR labels)
                     let mode = ui_set.display;
-                    let cols_px = g.width().max(1.0) as usize;
                     if mode < 4 {
                         if let Some(h) = meters.hist.try_lock() {
                             let written = h.written;
-                            let span_cols = |secs: f32| (secs / COL_SECS) as u64;
-                            let avail = written.min(crate::HIST_CAP as u64);
-                            // newest column at the right edge; map pixel -> (age range in columns)
-                            let range_for = |px: usize| -> (u64, u64) {
-                                let t = 1.0 - (px as f32 + 1.0) / cols_px as f32; // 0 at right
-                                let t2 = 1.0 - px as f32 / cols_px as f32;
-                                let age = |t: f32| -> u64 {
-                                    match mode {
-                                        0 => (t * span_cols(4.0) as f32) as u64,
-                                        1 => (t * span_cols(12.0) as f32) as u64,
-                                        2 => {
-                                            // slow down: recent seconds wide, older ones squeezed
-                                            let a = (t.powf(2.2) * span_cols(20.0) as f32) as u64;
-                                            a
-                                        }
-                                        _ => (t * avail.max(span_cols(4.0)) as f32) as u64,
-                                    }
-                                };
-                                (age(t), age(t2).max(age(t) + 1))
+                            if written != st.hist_written {
+                                st.hist_written = written;
+                                st.hist_t = Instant::now();
+                            }
+                            let frac = (st.hist_t.elapsed().as_secs_f32() / COL_SECS).min(1.0);
+                            let avail = written.min(crate::HIST_CAP as u64) as i64;
+                            let w = g.width();
+                            let per_s = 1.0 / COL_SECS;
+                            let span = match mode {
+                                0 => 4.0 * per_s,
+                                1 => 12.0 * per_s,
+                                2 => 20.0 * per_s,
+                                _ => (avail as f32).max(4.0 * per_s),
                             };
-                            let mut inp = vec![-200.0f32; cols_px];
-                            let mut out = vec![-200.0f32; cols_px];
-                            let mut grs = vec![0.0f32; cols_px];
-                            let mut loud = vec![-200.0f32; cols_px];
-                            for px in 0..cols_px {
-                                let (a0, a1) = range_for(px);
+                            let to_x = |age: f32| -> f32 {
+                                let t = (age / span).clamp(0.0, 1.0);
+                                let t = if mode == 2 { t.powf(1.0 / 2.2) } else { t };
+                                g.right() - t * w
+                            };
+                            // newest first
+                            let mut pts: Vec<(f32, Column)> = Vec::with_capacity(1024);
+                            let newest = written as i64 - 1;
+                            let oldest = written as i64 - avail;
+                            let mut idx = newest;
+                            while idx >= oldest && idx >= 0 {
+                                let age = (newest - idx) as f32 + frac;
+                                if age > span + 1.0 {
+                                    break;
+                                }
+                                let ppc = (to_x(age) - to_x(age + 1.0)).max(1e-4);
+                                let kk = (1.5 / ppc).log2().ceil().clamp(0.0, 20.0) as u32;
+                                let gs = ((idx >> kk) << kk).max(oldest);
                                 let mut c = Column { inp: -200.0, out: -200.0, gr: 0.0, loud: -200.0 };
-                                let mut any = false;
-                                let step = ((a1 - a0) / 64).max(1);
-                                let mut a = a0;
-                                while a < a1 {
-                                    if a < avail {
-                                        let col = h.get(written - 1 - a);
-                                        c.inp = c.inp.max(col.inp);
-                                        c.out = c.out.max(col.out);
-                                        c.gr = c.gr.max(col.gr);
-                                        c.loud = c.loud.max(col.loud);
-                                        any = true;
-                                    }
-                                    a += step;
+                                for j in gs..=idx {
+                                    let col = h.get(j as u64);
+                                    c.inp = c.inp.max(col.inp);
+                                    c.out = c.out.max(col.out);
+                                    c.gr = c.gr.max(col.gr);
+                                    c.loud = c.loud.max(col.loud);
                                 }
-                                if any {
-                                    inp[px] = c.inp;
-                                    out[px] = c.out;
-                                    grs[px] = c.gr;
-                                    loud[px] = c.loud;
-                                }
+                                let mid = (newest as f32 - (gs + idx) as f32 * 0.5) + frac;
+                                pts.push((to_x(mid), c));
+                                idx = gs - 1;
                             }
                             drop(h);
-                            // soften the column steps: a short peak-hold, then a small triangular
-                            // average, so the traces read as smooth envelopes with their peaks kept
-                            let soften = |v: &[f32], floor: f32| -> Vec<f32> {
-                                let n = v.len();
-                                let held: Vec<f32> = (0..n)
-                                    .map(|i| {
-                                        let a = i.saturating_sub(1);
-                                        let b = (i + 1).min(n - 1);
-                                        v[a..=b].iter().cloned().fold(f32::MIN, f32::max)
-                                    })
-                                    .collect();
-                                (0..n)
-                                    .map(|i| {
-                                        if v[i] <= floor {
-                                            return v[i];
-                                        }
-                                        let mut acc = 0.0;
-                                        let mut wsum = 0.0;
-                                        for (k, w) in [(-2i32, 1.0f32), (-1, 2.0), (0, 3.0), (1, 2.0), (2, 1.0)] {
-                                            let j = i as i32 + k;
-                                            if j >= 0 && (j as usize) < n && held[j as usize] > floor {
-                                                acc += held[j as usize] * w;
-                                                wsum += w;
+                            pts.reverse();
+                            let n = pts.len();
+                            // headroom for the next frame: the loudest input on screen, in 3 dB
+                            // steps (up quickly, down slowly)
+                            let max_in = pts.iter().map(|(_, c)| c.inp).fold(-200.0f32, f32::max);
+                            let want_head = ((max_in.max(0.0) + 0.5) / 3.0).ceil().min(8.0) * 3.0;
+                            let want_head = if max_in > 0.0 { want_head } else { 0.0 };
+                            let dtf = ui.input(|i| i.stable_dt).min(0.1);
+                            let tau = if want_head > st.head_sm { 0.15 } else { 2.0 };
+                            st.head_sm += (want_head - st.head_sm) * (1.0 - (-dtf / tau).exp());
+                            if n > 1 {
+                                // a light [1 2 1] smoothing of the levels (dB) for clean curves
+                                let sm = |f: &dyn Fn(&Column) -> f32, floor: f32| -> Vec<f32> {
+                                    (0..n)
+                                        .map(|i| {
+                                            let v = f(&pts[i].1);
+                                            if v <= floor {
+                                                return v;
                                             }
+                                            let a = f(&pts[i.saturating_sub(1)].1).max(floor);
+                                            let b = f(&pts[(i + 1).min(n - 1)].1).max(floor);
+                                            (a + 2.0 * v + b) * 0.25
+                                        })
+                                        .collect()
+                                };
+                                let xs: Vec<f32> = pts.iter().map(|(x, _)| *x).collect();
+                                let v_in = sm(&|c| c.inp, -150.0);
+                                let v_out = sm(&|c| c.out, -150.0);
+                                let v_loud = sm(&|c| c.loud, -60.0);
+                                let floor_y = g.bottom();
+                                let to_y = |v: f32| ypos(v).clamp(g.top(), floor_y);
+                                let fade = |x: f32| edge_fade((x - g.left()).max(0.0) as usize);
+                                let uv = egui::epaint::WHITE_UV;
+                                // a filled band between two curves (top / bottom per point)
+                                let band = |tops: &[f32], bots: &[f32], on: &dyn Fn(usize) -> bool, ct: Color32, cb: Color32| {
+                                    let mut mesh = egui::Mesh::default();
+                                    let mut prev = false;
+                                    for i in 0..n {
+                                        if !on(i) {
+                                            prev = false;
+                                            continue;
                                         }
-                                        acc / wsum
-                                    })
-                                    .collect()
-                            };
-                            let inp = soften(&inp, -150.0);
-                            let out = soften(&out, -150.0);
-                            let grs = soften(&grs, 0.0);
-                            let floor_y = g.bottom();
-                            let to_y = |v: f32| ypos(v).clamp(g.top(), floor_y);
-                            // input (behind): a dim area
-                            let col_in = Color32::from_rgb(0x9a, 0x6c, 0xb4);
-                            area(&painter, g.left(), &inp, -150.0, &to_y, floor_y, col_in.gamma_multiply(0.42), col_in.gamma_multiply(0.06), Some(Stroke::new(1.0_f32, col_in.gamma_multiply(0.9))));
-                            // output: bright at the top, fading to the floor, with a light rim
-                            let col_out = Color32::from_rgb(0xd2, 0xb6, 0xe2);
-                            let col_out_lo = Color32::from_rgb(0x2e, 0x1e, 0x38);
-                            area(&painter, g.left(), &out, -150.0, &to_y, floor_y, col_out.gamma_multiply(0.40), col_out_lo.gamma_multiply(0.10), Some(Stroke::new(1.4_f32, Color32::from_rgb(0xf4, 0xe6, 0xfa))));
-                            // gain reduction hangs from the top: deep red at the top, rose at its edge
-                            let to_gr = |v: f32| gr_y(v).clamp(g.top(), floor_y);
-                            {
-                                let mut mesh = egui::Mesh::default();
-                                let mut rim: Vec<Pos2> = vec![];
-                                let mut rims: Vec<Vec<Pos2>> = vec![];
-                                let mut prev = false;
-                                for (px, v) in grs.iter().enumerate() {
-                                    let x = g.left() + px as f32;
-                                    let on = *v > 0.02;
-                                    if on {
-                                        let y = to_gr(*v);
-                                        let base = mesh.vertices.len() as u32;
-                                        let uv = egui::epaint::WHITE_UV;
-                                        let f = edge_fade(px);
-                                        mesh.vertices.push(egui::epaint::Vertex { pos: Pos2::new(x, g.top()), uv, color: Color32::from_rgb(0x8a, 0x16, 0x3a).gamma_multiply(0.18 * f) });
-                                        mesh.vertices.push(egui::epaint::Vertex { pos: Pos2::new(x, y), uv, color: Color32::from_rgb(0xff, 0x5c, 0x8e).gamma_multiply(0.62 * f) });
+                                        let f = fade(xs[i]);
+                                        let b = mesh.vertices.len() as u32;
+                                        mesh.vertices.push(egui::epaint::Vertex { pos: Pos2::new(xs[i], tops[i]), uv, color: ct.gamma_multiply(f) });
+                                        mesh.vertices.push(egui::epaint::Vertex { pos: Pos2::new(xs[i], bots[i]), uv, color: cb.gamma_multiply(f) });
                                         if prev {
-                                            mesh.indices.extend_from_slice(&[base - 2, base - 1, base + 1, base - 2, base + 1, base]);
+                                            mesh.indices.extend_from_slice(&[b - 2, b, b + 1, b - 2, b + 1, b - 1]);
                                         }
-                                        rim.push(Pos2::new(x, y));
-                                    } else if !rim.is_empty() {
-                                        rims.push(std::mem::take(&mut rim));
+                                        prev = true;
                                     }
-                                    prev = on;
+                                    painter.add(egui::Shape::mesh(mesh));
+                                };
+                                let rim = |ys: &[f32], on: &dyn Fn(usize) -> bool, st_: Stroke| {
+                                    let mut line: Vec<Pos2> = vec![];
+                                    for i in 0..n {
+                                        if on(i) {
+                                            line.push(Pos2::new(xs[i], ys[i]));
+                                        } else if line.len() > 1 {
+                                            faded_line(&painter, g.left(), std::mem::take(&mut line), st_);
+                                        } else {
+                                            line.clear();
+                                        }
+                                    }
+                                    if line.len() > 1 {
+                                        faded_line(&painter, g.left(), line, st_);
+                                    }
+                                };
+                                let y_in: Vec<f32> = v_in.iter().map(|v| to_y(*v)).collect();
+                                let y_out: Vec<f32> = v_out.iter().map(|v| to_y(*v)).collect();
+                                let bottoms = vec![floor_y; n];
+                                let has_in = |i: usize| v_in[i] > -150.0;
+                                let has_out = |i: usize| v_out[i] > -150.0;
+                                // input (with Gain): a soft veil behind
+                                let col_in = Color32::from_rgb(0x9a, 0x6c, 0xb4);
+                                band(&y_in, &bottoms, &has_in, col_in.gamma_multiply(0.30), col_in.gamma_multiply(0.04));
+                                // output: lit at its edge, fading to the floor
+                                let col_out = Color32::from_rgb(0xd2, 0xb6, 0xe2);
+                                band(&y_out, &bottoms, &has_out, col_out.gamma_multiply(0.42), Color32::from_rgb(0x2e, 0x1e, 0x38).gamma_multiply(0.10));
+                                // what the limiter took away: the red band between output and input
+                                let cut = |i: usize| has_in(i) && has_out(i) && y_out[i] - y_in[i] > 0.6;
+                                band(&y_in, &y_out, &cut, Color32::from_rgb(0xff, 0x5c, 0x8e).gamma_multiply(0.30), Color32::from_rgb(0xff, 0x4a, 0x7c).gamma_multiply(0.75));
+                                rim(&y_in, &has_in, Stroke::new(1.0_f32, col_in.gamma_multiply(0.85)));
+                                rim(&y_in, &cut, Stroke::new(1.3_f32, ROSE));
+                                rim(&y_out, &has_out, Stroke::new(1.4_f32, Color32::from_rgb(0xf4, 0xe6, 0xfa)));
+                                // loudness
+                                let lp: Vec<Pos2> = (0..n).filter(|i| v_loud[*i] > -60.0).map(|i| Pos2::new(xs[i], to_y(v_loud[i]))).collect();
+                                if lp.len() > 1 {
+                                    faded_line(&painter, g.left(), lp, Stroke::new(1.5_f32, AMBER));
                                 }
-                                rims.push(rim);
-                                painter.add(egui::Shape::mesh(mesh));
-                                for r in rims.into_iter().filter(|r| r.len() > 1) {
-                                    faded_line(&painter, g.left(), r, Stroke::new(1.3_f32, ROSE));
-                                }
-                            }
-                            // loudness: a smoothed amber line
-                            let loud = soften(&loud, -60.0);
-                            let pts: Vec<Pos2> = (0..cols_px).filter(|px| loud[*px] > -60.0).map(|px| Pos2::new(g.left() + px as f32, ypos(loud[px]))).collect();
-                            if pts.len() > 1 {
-                                faded_line(&painter, g.left(), pts, Stroke::new(1.5_f32, AMBER));
-                            }
-                            // soft edges: the oldest history fades in from the left and the fills
-                            // melt into the floor, instead of being cut off square
-                            // gain-reduction peak labels: local maxima, at least 60 px apart
-                            let mut last_x = -1000.0f32;
-                            let win = 30usize;
-                            for px in 0..cols_px {
-                                let v = grs[px];
-                                if v < 0.5 {
-                                    continue;
-                                }
-                                let lo = px.saturating_sub(win);
-                                let hi = (px + win).min(cols_px - 1);
-                                let is_max = (lo..=hi).all(|k| grs[k] < v || (grs[k] == v && k >= px));
-                                let x = g.left() + px as f32;
-                                if is_max && x - last_x > 60.0 {
-                                    let txt = format!("-{:.1}", v);
-                                    let y = gr_y(v) + 10.0;
-                                    let tr = Rect::from_center_size(Pos2::new(x.clamp(g.left() + 20.0, g.right() - 20.0), y.min(g.top() + g.height() * 0.45)), Vec2::new(38.0, 15.0));
-                                    painter.rect_filled(tr, CornerRadius::same(8), ROSE.gamma_multiply(0.92));
-                                    painter.text(tr.center(), Align2::CENTER_CENTER, txt, mono(9.0), Color32::from_rgb(0x22, 0x0a, 0x14));
-                                    last_x = x;
+                                // gain-reduction peak labels: the largest GR within +-40 px, at least
+                                // 64 px apart, sitting on the input crest
+                                let mut last_x = -1000.0f32;
+                                for i in 0..n {
+                                    let v = pts[i].1.gr;
+                                    if v < 0.5 || xs[i] < g.left() + 12.0 {
+                                        continue;
+                                    }
+                                    let x = xs[i];
+                                    let is_max = (0..n).filter(|j| (xs[*j] - x).abs() <= 40.0).all(|j| pts[j].1.gr < v || (pts[j].1.gr == v && j >= i));
+                                    if is_max && x - last_x > 64.0 {
+                                        let y = (y_in[i] - 12.0).clamp(g.top() + 8.0, g.bottom() - 8.0);
+                                        let tr = Rect::from_center_size(Pos2::new(x.clamp(g.left() + 20.0, g.right() - 20.0), y), Vec2::new(38.0, 15.0));
+                                        painter.rect_filled(tr, CornerRadius::same(8), ROSE.gamma_multiply(0.92 * fade(x)));
+                                        painter.text(tr.center(), Align2::CENTER_CENTER, format!("-{:.1}", v), mono(9.0), Color32::from_rgb(0x22, 0x0a, 0x14).gamma_multiply(fade(x)));
+                                        last_x = x;
+                                    }
                                 }
                             }
                         }
