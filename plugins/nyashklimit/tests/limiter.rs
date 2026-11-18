@@ -58,8 +58,8 @@ fn db(x: f32) -> f32 {
 /// independent true-peak measurement: 16x interpolation with a long filter
 fn true_peak(x: &[f32]) -> f32 {
     let l = 16;
-    let taps = 32;
-    let h = lowpass(taps * l + 1, 0.49 / l as f64, 10.0);
+    let taps = 64;
+    let h = lowpass(taps * l + 1, 0.5 / l as f64, 9.0);
     let mut m = 0.0f32;
     for n in taps..x.len() {
         for ph in 0..l {
@@ -279,4 +279,5 @@ fn loudness_range_matches_tech3342() {
     eprintln!("LRA {:.2}", ld.lra);
     assert!((ld.lra - 10.0).abs() < 1.0, "LRA {:.2}, want 10 +- 1", ld.lra);
 }
+
 

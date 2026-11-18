@@ -301,6 +301,8 @@ pub struct Limiter {
     bypass_x: f32,
     dither: Dither,
     safe_pk: Vec<Delay>,
+    /// the previous true-peak reading: a peak between two samples needs both of them turned down
+    tp_prev: [f32; MAX_CH],
     latency: usize,
     pub stats: BlockStats,
     /// oversampling change waiting for the output to fade out
@@ -348,6 +350,7 @@ impl Limiter {
             bypass_x: 0.0,
             dither: Dither::new(0x9E37_79B9_7F4A_7C15),
             safe_pk: vec![],
+            tp_prev: [0.0; MAX_CH],
             latency: 0,
             stats: BlockStats::default(),
             pending: None,
@@ -501,6 +504,9 @@ impl Limiter {
     /// Process one frame. `sc` is the external side chain (used when `sidechain` is on).
     #[inline]
     pub fn process(&mut self, x: [f32; MAX_CH], sc: [f32; MAX_CH]) -> [f32; MAX_CH] {
+        // a NaN / inf from the host would stay in the delay lines and the gain for good: silence
+        let x = x.map(|v| if v.is_finite() { v } else { 0.0 });
+        let sc = sc.map(|v| if v.is_finite() { v } else { 0.0 });
         self.fresh = false;
         // an oversampling change: fade out (5 ms), rebuild, wait for the new delay lines to
         // fill, fade in (5 ms)
@@ -655,7 +661,9 @@ impl Limiter {
         let mut req_s = [0.0f32; MAX_CH];
         for c in 0..nch {
             // both detectors report the sample `tp_lat` back, so the audio delay is the same
-            let tp = self.safe_tp[c].push(y[c]);
+            let tp_now = self.safe_tp[c].push(y[c]);
+            let tp = tp_now.max(self.tp_prev[c]);
+            self.tp_prev[c] = tp_now;
             let sp = self.safe_pk[c].tick(y[c]).abs();
             let pk = if p.true_peak { tp.max(sp) } else { sp };
             req_s[c] = (db(pk) - ceil_db).max(0.0);

@@ -52,8 +52,8 @@ fn run_with(l: &mut Limiter, x: &[[f32; 2]], nch: usize) -> Vec<[f32; 2]> {
 /// cheap true-peak check: 8x windowed-sinc interpolation
 fn tp8(x: &[f32]) -> f32 {
     let l = 8;
-    let taps = 32;
-    let h = nyashklimit::os::lowpass(taps * l + 1, 0.49 / l as f64, 10.0);
+    let taps = 64;
+    let h = nyashklimit::os::lowpass(taps * l + 1, 0.5 / l as f64, 9.0);
     let mut m = 0.0f32;
     for n in taps..x.len() {
         for ph in 0..l {
@@ -276,6 +276,24 @@ fn dither_never_breaks_the_ceiling() {
             let y = run_with(&mut l, &x, 2);
             let sp = y.iter().fold(0.0f32, |a, f| a.max(f[0].abs()).max(f[1].abs()));
             assert!(sp <= 1.0, "{bits} {sh:?}: {sp}");
+        }
+    }
+}
+
+#[test]
+fn recovers_after_nan_or_inf_from_the_host() {
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        for tp in [false, true] {
+            let mut l = Limiter::new(48000.0, 2);
+            l.set_params(&Params { true_peak: tp, ..base() });
+            for n in 0..96000 {
+                let v = if (100..110).contains(&n) { bad } else { 0.5 * (n as f32 * 0.05).sin() };
+                let sc = if (200..205).contains(&n) { bad } else { 0.0 };
+                let y = l.process([v, v], [sc, sc]);
+                if n > 48000 {
+                    assert!(y[0].is_finite() && y[1].is_finite() && y[0].abs() < 1.0, "{bad} tp {tp}: n {n} {y:?}");
+                }
+            }
         }
     }
 }

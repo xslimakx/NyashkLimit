@@ -40,14 +40,39 @@ pub fn lowpass(n: usize, fc: f64, beta: f64) -> Vec<f64> {
     h
 }
 
+/// Dot product over the shorter of the two slices, in 8 independent lanes so the compiler can
+/// vectorise it (a single running sum cannot be reordered).
+#[inline]
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let mut lane = [0.0f32; 8];
+    let mut ca = a.chunks_exact(8);
+    let mut cb = b.chunks_exact(8);
+    for (x, y) in (&mut ca).zip(&mut cb) {
+        for k in 0..8 {
+            lane[k] += x[k] * y[k];
+        }
+    }
+    let mut acc: f32 = lane.iter().sum();
+    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+        acc += x * y;
+    }
+    acc
+}
+
 /// Taps per phase for a given factor.
+pub const TAPS: usize = 64;
+/// The decimator is twice as long: it has to stop everything from the base Nyquist up (what a
+/// clipper or fast gain makes up there would otherwise fold back or ring as inter-sample peaks)
+/// while still passing 20 kHz at 44.1 kHz.
+pub const TAPS_DOWN: usize = 128;
 pub fn taps_for(factor: usize) -> usize {
     match factor {
         1 => 0,
-        2 => 32,
-        // the same 24 taps per phase from 4x up: the filter's transition band (in base-rate Hz)
-        // stays the same, so 8x..32x keep the full audio band (flat to ~17 kHz at 48 kHz)
-        _ => 24,
+        // the same taps per phase at every factor: the transition band (in base-rate Hz) stays
+        // the same, from 0.4535 fs (20 kHz at 44.1 kHz) to 0.5465 fs, centred on Nyquist
+        _ => TAPS,
     }
 }
 
@@ -71,8 +96,9 @@ impl Oversampler {
             return Self { factor: 1, taps: 0, phases: vec![], down: vec![], hist_in: vec![], hi: 0, hist_os: vec![], ho: 0 };
         }
         let n = taps * factor + 1;
-        // pass band up to ~0.45 of the base rate, stop band from 0.5
-        let fc = 0.475 / factor as f64;
+        // pass band flat to 0.4535 of the base rate (20 kHz at 44.1 kHz), images of it (from
+        // 0.5465) at least ~90 dB down; what lies in between is above 20 kHz
+        let fc = 0.5 / factor as f64;
         let h = lowpass(n, fc, 9.0);
         let mut phases = vec![Vec::new(); factor];
         for (p, ph) in phases.iter_mut().enumerate() {
@@ -82,9 +108,11 @@ impl Oversampler {
                 j += 1;
             }
         }
-        let down: Vec<f32> = h.iter().map(|v| *v as f32).collect();
+        // decimator: flat to 0.4535, stop band from 0.5 of the base rate
+        let nd = TAPS_DOWN * factor + 1;
+        let down: Vec<f32> = lowpass(nd, 0.4768 / factor as f64, 9.0).iter().map(|v| *v as f32).collect();
         let lin = taps + 2;
-        Self { factor, taps, phases, down, hist_in: vec![0.0; 2 * lin], hi: 0, hist_os: vec![0.0; 2 * (n + factor)], ho: 0 }
+        Self { factor, taps: (taps + TAPS_DOWN) / 2, phases, down, hist_in: vec![0.0; 2 * lin], hi: 0, hist_os: vec![0.0; 2 * (nd + factor)], ho: 0 }
     }
 
     /// Latency at the base rate (up + down).
@@ -112,11 +140,7 @@ impl Oversampler {
         self.hist_in[self.hi + lin] = x;
         let hist = &self.hist_in[self.hi..self.hi + lin];
         for (p, ph) in self.phases.iter().enumerate() {
-            let mut acc = 0.0f32;
-            for (c, v) in ph.iter().zip(hist.iter()) {
-                acc += c * v;
-            }
-            out[p] = acc;
+            out[p] = dot(ph, hist);
         }
     }
 
@@ -136,16 +160,12 @@ impl Oversampler {
         // filter delay stays a whole number of base-rate samples
         let off = self.factor - 1;
         let hist = &self.hist_os[self.ho + off..self.ho + off + self.down.len()];
-        let mut acc = 0.0f32;
-        for (c, v) in self.down.iter().zip(hist.iter()) {
-            acc += c * v;
-        }
-        acc
+        dot(&self.down, hist)
     }
 }
 
 /// True-peak estimator (ITU-R BS.1770-4 style, finer): the largest absolute value of the signal
-/// interpolated 16x (8x at 88.2 / 96 kHz, 4x above). BS.1770 asks for at least 4x, but 4x can
+/// interpolated 16x (8x from 88.2 kHz up). BS.1770 asks for at least 4x, but 4x can
 /// miss a worst-case peak near a quarter of the sample rate by over half a dB.
 pub struct TruePeak {
     phases: Vec<Vec<f32>>,
@@ -156,16 +176,14 @@ pub struct TruePeak {
 
 impl TruePeak {
     pub fn new(fs: f32) -> Self {
-        let factor = if fs >= 176_000.0 {
-            4
-        } else if fs >= 88_000.0 {
-            8
-        } else {
-            16
-        };
-        let taps = 32;
+        // (8x at high rates too: content near a quarter of the rate exists there as well, and 4x
+        // can miss its peaks by over half a dB)
+        let factor = if fs >= 88_000.0 { 8 } else { 16 };
+        // the same band as the oversampler (flat to 20 kHz at 44.1 kHz): a shorter filter would
+        // under-read peaks made of content near the top of the band
+        let taps = TAPS;
         let n = taps * factor + 1;
-        let h = lowpass(n, 0.495 / factor as f64, 10.0);
+        let h = lowpass(n, 0.5 / factor as f64, 9.0);
         let mut phases = vec![Vec::new(); factor];
         for (p, ph) in phases.iter_mut().enumerate() {
             let mut j = 0;
@@ -193,11 +211,7 @@ impl TruePeak {
         let hist = &self.hist[self.i..self.i + lin];
         let mut m = 0.0f32;
         for ph in self.phases.iter() {
-            let mut acc = 0.0f32;
-            for (c, v) in ph.iter().zip(hist.iter()) {
-                acc += c * v;
-            }
-            m = m.max(acc.abs());
+            m = m.max(dot(ph, hist).abs());
         }
         m
     }
