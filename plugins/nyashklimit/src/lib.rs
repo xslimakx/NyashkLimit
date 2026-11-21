@@ -389,6 +389,7 @@ pub struct NyashkLimit {
     col_len: usize,
     pending: Vec<Column>,
     was_playing: bool,
+    ui: UiSettings,
     rms_win: [f64; MAX_CH],
 }
 
@@ -407,6 +408,7 @@ impl Default for NyashkLimit {
             col_len: 480,
             pending: Vec::with_capacity(256),
             was_playing: false,
+            ui: UiSettings::default(),
             rms_win: [0.0; MAX_CH],
         }
     }
@@ -501,7 +503,11 @@ impl Plugin for NyashkLimit {
             self.meters.s.latency.store(lim.latency() as u32, Ordering::Relaxed);
         }
         let s = &self.meters.s;
-        let ui = *self.params.ui.read();
+        // never wait for the GUI: keep the last settings if it is writing them right now
+        if let Some(g) = self.params.ui.try_read() {
+            self.ui = *g;
+        }
+        let ui = self.ui;
 
         // resets requested by the GUI, and Auto-Reset when the host starts playing
         let playing = context.transport().playing;
