@@ -52,3 +52,7 @@ The bundle appears in `target/bundled/`. The tests check:
 
 ## License
 MIT
+
+## Credits
+
+UI font: [Inter](https://rsms.me/inter/) by Rasmus Andersson, SIL Open Font License 1.1 (`plugins/nyashklimit/src/fonts/Inter-LICENSE.txt`).

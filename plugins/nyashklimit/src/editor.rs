@@ -14,24 +14,27 @@ use std::time::{Duration, Instant};
 use crate::presets::PRESETS;
 use crate::{Column, DitherParam, LimitParams, Meters, OsParam, ShapingParam, StyleParam, UiSettings, COL_SECS};
 
-// palette: night plum, lilac, rose, crimson
-const BG: Color32 = Color32::from_rgb(0x12, 0x0c, 0x14);
-const PANEL: Color32 = Color32::from_rgb(0x1a, 0x11, 0x1d);
-const PANEL2: Color32 = Color32::from_rgb(0x26, 0x19, 0x2b);
-const WHITE: Color32 = Color32::from_rgb(0xf0, 0xe6, 0xf5);
-const DIM: Color32 = Color32::from_rgb(0xae, 0x9a, 0xb6);
-const LILAC: Color32 = Color32::from_rgb(0xb4, 0x8a, 0xc9);
-const ROSE: Color32 = Color32::from_rgb(0xe0, 0x5a, 0x8a);
-const CRIMSON: Color32 = Color32::from_rgb(0xc7, 0x3a, 0x5e);
-const AMBER: Color32 = Color32::from_rgb(0xe8, 0xb0, 0x5a);
-
+// palette: the Nyashk flat design system (same as NyashkEQ): neutral graphite surfaces, two text
+// levels, one accent (coral red for gain reduction / active), a cool blue-grey for the signal,
+// amber for loudness
+const BG: Color32 = Color32::from_rgb(13, 14, 18);
+const PANEL: Color32 = Color32::from_rgb(22, 24, 30);
+const PANEL2: Color32 = Color32::from_rgb(32, 35, 43);
+const BTN_H: Color32 = Color32::from_rgb(44, 48, 58);
+const BORDER: Color32 = Color32::from_rgb(40, 44, 54);
+const WHITE: Color32 = Color32::from_rgb(232, 234, 239);
+const DIM: Color32 = Color32::from_rgb(138, 145, 160);
+const LILAC: Color32 = Color32::from_rgb(140, 160, 196);
+const ROSE: Color32 = Color32::from_rgb(242, 92, 112);
+const CRIMSON: Color32 = Color32::from_rgb(200, 60, 82);
+const AMBER: Color32 = Color32::from_rgb(232, 176, 90);
 
 const BASE_W: f32 = 980.0;
 const BASE_H: f32 = 600.0;
 
 /// UI font: a clean proportional sans (DejaVu Sans), slightly larger than the old mono
 fn mono(size: f32) -> FontId {
-    FontId::proportional(size + 0.5)
+    FontId::proportional(size)
 }
 fn set_norm<P: Param>(setter: &ParamSetter, p: &P, v: f32) {
     setter.begin_set_parameter(p);
@@ -48,14 +51,17 @@ fn set_e<E: Enum + PartialEq>(setter: &ParamSetter, p: &EnumParam<E>, v: E) {
     setter.set_parameter(p, v);
     setter.end_set_parameter(p);
 }
-/// ♯ and ♭ are not in egui's built-in fonts: DejaVu Sans as a fall-back after the primary font.
+/// Inter (SIL Open Font License, fonts/Inter-LICENSE.txt) for all text; DejaVu Sans after it
+/// for the few signs Inter lacks (♯ ♭).
 fn install_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontFamily};
     let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("inter".into(), Arc::new(FontData::from_static(include_bytes!("fonts/Inter-Medium.ttf"))));
     fonts.font_data.insert("dejavu".into(), Arc::new(FontData::from_static(include_bytes!("fonts/DejaVuSans.ttf"))));
     for fam in [FontFamily::Monospace, FontFamily::Proportional] {
         if let Some(list) = fonts.families.get_mut(&fam) {
             list.insert(0, "dejavu".into());
+            list.insert(0, "inter".into());
         }
     }
     ctx.set_fonts(fonts);
@@ -80,7 +86,6 @@ fn enum_combo<E: Enum + PartialEq + 'static>(ui: &mut Ui, id: &str, rect: Rect, 
             .response
             .rect;
     });
-    specular_rim(ui.painter(), btn, (btn.height() * 0.5).min(10.0), 0.7);
     pick
 }
 
@@ -137,20 +142,13 @@ fn knob<P: Param>(ui: &mut Ui, setter: &ParamSetter, p: &P, label: &str, id: &st
         (0..=n).map(|i| pt(ring, from + (to - from) * i as f32 / n as f32)).collect()
     };
     let w: f32 = if r > 34.0 { 4.0 } else { 3.2 };
-    painter.add(egui::Shape::line(arc(0.0, 1.0), PathStroke::new(w, Color32::from_white_alpha(18))));
+    painter.add(egui::Shape::line(arc(0.0, 1.0), PathStroke::new(w, if resp.hovered() || resp.dragged() { Color32::from_rgb(52, 56, 66) } else { Color32::from_rgb(40, 43, 51) })));
     let from = if bipolar { 0.5 } else { 0.0 };
     if (norm - from).abs() > 0.002 {
         painter.add(egui::Shape::line(arc(from, norm), PathStroke::new(w, ROSE)));
     }
-    let body = r * 0.72;
-    // soft shadow, then a gently lit body (lighter towards the top)
-    for k in 0..4 {
-        painter.circle_filled(c + Vec2::new(0.0, 3.0), body + 1.0 + k as f32 * 1.6, Color32::from_black_alpha(26 - k * 6));
-    }
-    painter.circle_filled(c, body, Color32::from_rgb(0x3a, 0x29, 0x42));
-    painter.circle_filled(c + Vec2::new(0.0, 1.2), body * 0.93, Color32::from_rgb(0x2b, 0x1d, 0x32));
-    painter.circle_filled(c - Vec2::new(0.0, body * 0.35), body * 0.45, Color32::from_white_alpha(5));
-    painter.circle_filled(pt(body * 0.62, norm), 2.6, WHITE);
+    // flat: the ring and a white dot at the value
+    painter.circle_filled(pt(ring, norm), w * 0.9 + 0.6, WHITE);
 
     // value box (click to type) + label
     let val = p.normalized_value_to_string(norm, true);
@@ -353,133 +351,23 @@ fn faded_line(painter: &egui::Painter, x0: f32, pts: Vec<Pos2>, st: Stroke) {
 }
 
 
-/// Soft round glow (radial gradient to transparent), for the backdrop behind the glass.
-fn glow(painter: &egui::Painter, c: Pos2, r: f32, col: Color32) {
-    let mut mesh = egui::Mesh::default();
-    let uv = egui::epaint::WHITE_UV;
-    mesh.vertices.push(egui::epaint::Vertex { pos: c, uv, color: col });
-    let n = 48;
-    for k in 0..=n {
-        let a = k as f32 / n as f32 * std::f32::consts::TAU;
-        mesh.vertices.push(egui::epaint::Vertex { pos: c + Vec2::new(a.cos(), a.sin()) * r, uv, color: Color32::TRANSPARENT });
-    }
-    for k in 1..=n as u32 {
-        mesh.indices.extend_from_slice(&[0, k, k + 1]);
-    }
-    painter.add(egui::Shape::mesh(mesh));
-}
-
-/// Vertical gradient in a rectangle (top colour to bottom colour).
-fn vgrad(painter: &egui::Painter, r: Rect, top: Color32, bottom: Color32) {
-    let mut mesh = egui::Mesh::default();
-    let uv = egui::epaint::WHITE_UV;
-    for (p, c) in [(r.left_top(), top), (r.right_top(), top), (r.right_bottom(), bottom), (r.left_bottom(), bottom)] {
-        mesh.vertices.push(egui::epaint::Vertex { pos: p, uv, color: c });
-    }
-    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-    painter.add(egui::Shape::mesh(mesh));
-}
-
-/// A vertical fade inside a rounded rectangle: `top` at the top edge, transparent `fade` px
-/// lower. Built from thin horizontal strips cut to the rounded outline, so no square corners.
-fn rounded_sheen(painter: &egui::Painter, r: Rect, rad: f32, top: Color32, fade: f32) {
-    let mut mesh = egui::Mesh::default();
-    let uv = egui::epaint::WHITE_UV;
-    let inset = |y: f32| -> f32 {
-        // horizontal inset of the rounded outline at height y
-        let dy = if y < r.top() + rad { r.top() + rad - y } else { 0.0 };
-        rad - (rad * rad - dy * dy).max(0.0).sqrt()
-    };
-    let steps = 40;
-    for k in 0..=steps {
-        let t = k as f32 / steps as f32;
-        // denser near the top, where the corner curves
-        let y = r.top() + fade * t * t;
-        let a = (1.0 - (y - r.top()) / fade).clamp(0.0, 1.0);
-        let c = top.gamma_multiply(a * a);
-        let i = inset(y) + 0.5;
-        mesh.vertices.push(egui::epaint::Vertex { pos: Pos2::new(r.left() + i, y), uv, color: c });
-        mesh.vertices.push(egui::epaint::Vertex { pos: Pos2::new(r.right() - i, y), uv, color: c });
-        if k > 0 {
-            let b = (k as u32) * 2;
-            mesh.indices.extend_from_slice(&[b - 2, b - 1, b + 1, b - 2, b + 1, b]);
-        }
-    }
-    painter.add(egui::Shape::mesh(mesh));
-}
-
-/// A soft card (iOS-like): no hard frame, a large radius, a wide soft shadow, a gently lighter
-/// top. `dark` is the recessed display well.
+/// A flat card: solid surface, 12 px radius, a thin border and a soft shadow. `dark` is the
+/// recessed display well.
 fn glass(painter: &egui::Painter, r: Rect, dark: bool) {
-    let rad = 20.0;
-    // wide, faint shadow in layers
-    for k in 0..6 {
-        let e = 2.0 + k as f32 * 3.0;
-        painter.rect_filled(r.translate(Vec2::new(0.0, 7.0)).expand(e), CornerRadius::same((rad + e) as u8), Color32::from_black_alpha(15 - k as u8 * 2));
-    }
-    let cr = CornerRadius::same(rad as u8);
-    // the glass body: a tinted, see-through pane (the coloured backdrop shows through)
-    if dark {
-        painter.rect_filled(r, cr, Color32::from_rgba_unmultiplied(8, 5, 12, 205));
-    } else {
-        painter.rect_filled(r, cr, Color32::from_rgba_unmultiplied(40, 24, 50, 118));
-    }
-    // light passing through: brighter at the top, following the rounded corners
-    rounded_sheen(painter, r, rad, Color32::from_white_alpha(if dark { 7 } else { 16 }), (r.height() * 0.55).min(110.0));
-    // refraction at the edge: a soft bright band just inside the outline
+    let rad = 12.0;
     for k in 0..4 {
-        let inset = 1.0 + k as f32 * 1.5;
-        let a = [12u8, 7, 4, 2][k];
-        painter.rect_stroke(r.shrink(inset), CornerRadius::same((rad - inset) as u8), Stroke::new(1.5_f32, Color32::from_white_alpha(if dark { a / 2 } else { a })), StrokeKind::Inside);
+        let e = 1.0 + k as f32 * 2.0;
+        painter.rect_filled(r.translate(Vec2::new(0.0, 3.0)).expand(e), CornerRadius::same((rad + e) as u8), Color32::from_black_alpha(14));
     }
-    // specular rim: strong where the edge faces the light (top-left), a weaker bounce opposite
-    specular_rim(painter, r, rad, if dark { 0.55 } else { 1.0 });
-}
-
-/// The outline of a rounded rectangle as points with outward normals (clockwise from top-left).
-fn rounded_outline(r: Rect, rad: f32) -> Vec<(Pos2, Vec2)> {
-    let mut pts = vec![];
-    let corners = [
-        (Pos2::new(r.left() + rad, r.top() + rad), std::f32::consts::PI),
-        (Pos2::new(r.right() - rad, r.top() + rad), std::f32::consts::PI * 1.5),
-        (Pos2::new(r.right() - rad, r.bottom() - rad), 0.0),
-        (Pos2::new(r.left() + rad, r.bottom() - rad), std::f32::consts::PI * 0.5),
-    ];
-    for (c, a0) in corners {
-        let n = 12;
-        for k in 0..=n {
-            let a = a0 + k as f32 / n as f32 * std::f32::consts::FRAC_PI_2;
-            let d = Vec2::new(a.cos(), a.sin());
-            pts.push((c + d * rad, d));
-        }
-    }
-    pts
-}
-
-/// Glass edge highlight: each outline segment is lit by how much it faces the light.
-fn specular_rim(painter: &egui::Painter, r: Rect, rad: f32, strength: f32) {
-    let light = Vec2::new(-0.55, -0.83);
-    let pts = rounded_outline(r.shrink(0.5), rad - 0.5);
-    let n = pts.len();
-    for k in 0..n {
-        let (a, na) = pts[k];
-        let (b, nb) = pts[(k + 1) % n];
-        let nrm = (na + nb).normalized();
-        let d = nrm.dot(light);
-        let lit = d.max(0.0).powf(1.6) * 150.0 + (-d).max(0.0).powf(2.0) * 50.0 + 16.0;
-        let alpha = (lit * strength).min(255.0) as u8;
-        painter.line_segment([a, b], Stroke::new(1.1_f32, Color32::from_white_alpha(alpha)));
-    }
-}
-
-/// A small glass control (pill): see-through fill, top sheen, specular edge.
-fn glass_pill(painter: &egui::Painter, r: Rect, hover: bool) {
-    let rad = (r.height() * 0.5).min(12.0);
     let cr = CornerRadius::same(rad as u8);
-    painter.rect_filled(r.translate(Vec2::new(0.0, 1.5)), cr, Color32::from_black_alpha(30));
-    painter.rect_filled(r, cr, Color32::from_rgba_unmultiplied(255, 236, 250, if hover { 30 } else { 16 }));
-    rounded_sheen(painter, r, rad, Color32::from_white_alpha(14), r.height() * 0.6);
-    specular_rim(painter, r, rad, 0.75);
+    painter.rect_filled(r, cr, if dark { Color32::from_rgb(11, 12, 15) } else { PANEL });
+    painter.rect_stroke(r, cr, Stroke::new(1.0_f32, BORDER), StrokeKind::Inside);
+}
+
+/// A small control surface: flat fill, lighter on hover.
+fn glass_pill(painter: &egui::Painter, r: Rect, hover: bool) {
+    let rad = (r.height() * 0.5).min(6.0);
+    painter.rect_filled(r, CornerRadius::same(rad as u8), if hover { BTN_H } else { PANEL2 });
 }
 
 /// gain reduction as text: "-3.2", and a plain "0.0" when there is none
@@ -491,25 +379,15 @@ fn gr_txt(v: f32) -> String {
     }
 }
 
-/// small text button
+/// small text button: flat, the accent colour when on
 fn tbtn(ui: &mut Ui, rect: Rect, text: &str, on: bool, tip: &str) -> bool {
     let resp = ui.allocate_rect(rect, Sense::click());
     let resp = if tip.is_empty() { resp } else { resp.on_hover_text(tip) };
     let p = ui.painter();
     let hov = resp.hovered();
-    let cr = CornerRadius::same((rect.height() * 0.5) as u8);
-    if on {
-        // lit rose glass with a soft glow around it
-        for k in 1..4 {
-            p.rect_filled(rect.expand(k as f32 * 1.8), CornerRadius::same((rect.height() * 0.5 + k as f32 * 1.8) as u8), ROSE.gamma_multiply(0.07));
-        }
-        p.rect_filled(rect, cr, ROSE.gamma_multiply(if hov { 1.0 } else { 0.9 }));
-        rounded_sheen(p, rect, rect.height() * 0.5, Color32::from_white_alpha(40), rect.height() * 0.65);
-        specular_rim(p, rect, rect.height() * 0.5, 0.9);
-    } else {
-        glass_pill(p, rect, hov);
-    }
-    p.text(rect.center(), Align2::CENTER_CENTER, text, mono(10.5), if on { WHITE } else { Color32::from_rgb(0xe6, 0xd8, 0xee) });
+    let cr = CornerRadius::same(6);
+    p.rect_filled(rect, cr, if on { if hov { ROSE.gamma_multiply(1.0) } else { ROSE } } else if hov { BTN_H } else { PANEL2 });
+    p.text(rect.center(), Align2::CENTER_CENTER, text, mono(11.0), if on { Color32::from_rgb(20, 10, 14) } else { WHITE });
     resp.clicked()
 }
 
@@ -531,7 +409,6 @@ fn list_combo(ui: &mut Ui, id: &str, rect: Rect, names: &[&str], cur: usize) -> 
             .response
             .rect;
     });
-    specular_rim(ui.painter(), btn, (btn.height() * 0.5).min(10.0), 0.7);
     pick
 }
 
@@ -550,19 +427,19 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
             v.extreme_bg_color = PANEL;
             v.override_text_color = Some(WHITE);
             v.window_stroke = Stroke::new(1.0_f32, Color32::from_white_alpha(14));
-            v.window_corner_radius = CornerRadius::same(14);
-            v.menu_corner_radius = CornerRadius::same(14);
-            v.window_fill = Color32::from_rgb(0x24, 0x18, 0x2b);
-            v.selection.bg_fill = Color32::from_rgb(0x5a, 0x2a, 0x45);
+            v.window_corner_radius = CornerRadius::same(10);
+            v.menu_corner_radius = CornerRadius::same(10);
+            v.window_fill = PANEL;
+            v.selection.bg_fill = Color32::from_rgb(70, 40, 50);
             v.selection.stroke = Stroke::new(1.0_f32, WHITE);
             for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
-                w.corner_radius = CornerRadius::same(10);
+                w.corner_radius = CornerRadius::same(6);
                 w.bg_stroke = Stroke::NONE;
             }
-            v.widgets.inactive.weak_bg_fill = Color32::from_rgba_unmultiplied(255, 236, 250, 11);
-            v.widgets.inactive.bg_fill = Color32::from_rgba_unmultiplied(255, 236, 250, 11);
-            v.widgets.hovered.weak_bg_fill = PANEL2;
-            v.widgets.hovered.bg_fill = PANEL2;
+            v.widgets.inactive.weak_bg_fill = PANEL2;
+            v.widgets.inactive.bg_fill = PANEL2;
+            v.widgets.hovered.weak_bg_fill = BTN_H;
+            v.widgets.hovered.bg_fill = BTN_H;
             v.widgets.active.weak_bg_fill = PANEL2;
             v.widgets.open.weak_bg_fill = PANEL2;
             v.widgets.hovered.bg_stroke = Stroke::NONE;
@@ -614,19 +491,13 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
                 let at = |x: f32, y: f32| Pos2::new(o.x + x, o.y + y);
                 let rect = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(at(x, y), Vec2::new(w, h));
                 let painter = ui.painter().clone();
-                // backdrop for the glass: a deep gradient with soft coloured glows
-                vgrad(&painter, full, Color32::from_rgb(0x1c, 0x10, 0x22), Color32::from_rgb(0x0c, 0x08, 0x10));
-                let sx = full.width() / BASE_W;
-                glow(&painter, at(60.0 * sx, 80.0 * sx), 340.0 * sx, Color32::from_rgba_unmultiplied(0xe0, 0x4f, 0x8a, 60));
-                glow(&painter, at(900.0 * sx, 560.0 * sx), 440.0 * sx, Color32::from_rgba_unmultiplied(0x7c, 0x52, 0xe0, 60));
-                glow(&painter, at(560.0 * sx, 0.0), 300.0 * sx, Color32::from_rgba_unmultiplied(0xff, 0x9e, 0xc8, 26));
-                glow(&painter, at(330.0 * sx, 620.0 * sx), 300.0 * sx, Color32::from_rgba_unmultiplied(0xc0, 0x4a, 0xb0, 40));
+                painter.rect_filled(full, CornerRadius::ZERO, BG);
                 let byp = p.bypass.value();
 
                 // ================= header
                 // logo, laid out by measured widths (proportional font)
                 let r1 = painter.text(at(16.0, 24.0), Align2::LEFT_CENTER, "Nyashk", mono(19.0), WHITE);
-                let r2 = painter.text(Pos2::new(r1.right() + 1.0, o.y + 24.0), Align2::LEFT_CENTER, "Limit", mono(19.0), LILAC);
+                let r2 = painter.text(Pos2::new(r1.right() + 1.0, o.y + 24.0), Align2::LEFT_CENTER, "Limit", mono(19.0), ROSE);
                 let r3 = painter.text(Pos2::new(r2.right() + 5.0, o.y + 23.0), Align2::LEFT_CENTER, "✦", mono(13.0), ROSE);
                 painter.text(Pos2::new(r3.right() + 8.0, o.y + 25.0), Align2::LEFT_CENTER, "TRUE PEAK LIMITER", mono(8.5), DIM);
                 // presets
@@ -651,7 +522,6 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
                                 }
                             }
                         });
-                    specular_rim(ui.painter(), pr.response.rect, (pr.response.rect.height() * 0.5).min(10.0), 0.7);
                 });
                 if tbtn(ui, rect(px + 236.0, 12.0, 24.0, 22.0), "‹", false, "Previous preset") {
                     st.preset = (st.preset + PRESETS.len() - 1) % PRESETS.len();
@@ -706,7 +576,7 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
                 // ---- Gain fader (left)
                 let fr = rect(14.0, top, 56.0, main_h);
                 glass(&painter, fr, false);
-                painter.text(Pos2::new(fr.center().x, fr.top() + 12.0), Align2::CENTER_CENTER, "GAIN", mono(9.5), LILAC);
+                painter.text(Pos2::new(fr.center().x, fr.top() + 12.0), Align2::CENTER_CENTER, "GAIN", mono(9.5), DIM);
                 let track = Rect::from_min_max(Pos2::new(fr.center().x - 4.0, fr.top() + 48.0), Pos2::new(fr.center().x + 4.0, fr.bottom() - 16.0));
                 let gnorm = p.gain.unmodulated_normalized_value();
                 let gy = track.bottom() - track.height() * gnorm;
@@ -722,7 +592,7 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
                 for k in 0..3 {
                     painter.rect_filled(handle.translate(Vec2::new(0.0, 2.0)).expand(1.0 + k as f32 * 1.5), CornerRadius::same(9), Color32::from_black_alpha(40 - k * 12));
                 }
-                painter.rect_filled(handle, CornerRadius::same(6), if gresp.hovered() || gresp.dragged() { WHITE } else { Color32::from_rgb(0xd8, 0xc8, 0xe0) });
+                painter.rect_filled(handle, CornerRadius::same(6), if gresp.hovered() || gresp.dragged() { WHITE } else { Color32::from_rgb(200, 205, 215) });
                 painter.hline(handle.left() + 6.0..=handle.right() - 6.0, handle.center().y, Stroke::new(1.0_f32, BG));
                 if gresp.drag_started() {
                     setter.begin_set_parameter(&p.gain);
@@ -823,7 +693,7 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
                     }
                     for t in ticks.into_iter().filter(|_| disp_on) {
                         let y = ypos(t);
-                        painter.hline(g.left()..=g.right(), y, Stroke::new(1.0_f32, Color32::from_rgb(0x1f, 0x15, 0x23)));
+                        painter.hline(g.left()..=g.right(), y, Stroke::new(1.0_f32, Color32::from_rgb(24, 26, 32)));
                         let lab = if t > 0.0 { format!("+{t:.0}") } else { k_label(scale, t).unwrap_or_else(|| format!("{t:.0}")) };
                         painter.text(Pos2::new(g.left() - 6.0, y), Align2::RIGHT_CENTER, lab, mono(9.0), DIM);
                     }
@@ -963,17 +833,17 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
                                 let has_in = |i: usize| v_in[i] > -150.0;
                                 let has_out = |i: usize| v_out[i] > -150.0;
                                 // input (with Gain): a soft veil behind
-                                let col_in = Color32::from_rgb(0x9a, 0x6c, 0xb4);
+                                let col_in = Color32::from_rgb(78, 92, 118);
                                 band(&y_in, &bottoms, &has_in, col_in.gamma_multiply(0.30), col_in.gamma_multiply(0.04));
                                 // output: lit at its edge, fading to the floor
-                                let col_out = Color32::from_rgb(0xd2, 0xb6, 0xe2);
-                                band(&y_out, &bottoms, &has_out, col_out.gamma_multiply(0.42), Color32::from_rgb(0x2e, 0x1e, 0x38).gamma_multiply(0.10));
+                                let col_out = Color32::from_rgb(150, 172, 210);
+                                band(&y_out, &bottoms, &has_out, col_out.gamma_multiply(0.42), Color32::from_rgb(30, 36, 48).gamma_multiply(0.10));
                                 // what the limiter took away: the red band between output and input
                                 let cut = |i: usize| has_in(i) && has_out(i) && y_out[i] - y_in[i] > 0.6;
-                                band(&y_in, &y_out, &cut, Color32::from_rgb(0xff, 0x5c, 0x8e).gamma_multiply(0.30), Color32::from_rgb(0xff, 0x4a, 0x7c).gamma_multiply(0.75));
+                                band(&y_in, &y_out, &cut, Color32::from_rgb(242, 92, 112).gamma_multiply(0.30), Color32::from_rgb(242, 80, 100).gamma_multiply(0.75));
                                 rim(&y_in, &has_in, Stroke::new(1.0_f32, col_in.gamma_multiply(0.85)));
                                 rim(&y_in, &cut, Stroke::new(1.3_f32, ROSE));
-                                rim(&y_out, &has_out, Stroke::new(1.4_f32, Color32::from_rgb(0xf4, 0xe6, 0xfa)));
+                                rim(&y_out, &has_out, Stroke::new(1.4_f32, Color32::from_rgb(225, 232, 245)));
                                 // loudness
                                 let lp: Vec<Pos2> = (0..n).filter(|i| v_loud[*i] > -60.0).map(|i| Pos2::new(xs[i], to_y(v_loud[i]))).collect();
                                 if lp.len() > 1 {
@@ -993,7 +863,7 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
                                         let y = (y_in[i] - 12.0).clamp(g.top() + 8.0, g.bottom() - 8.0);
                                         let tr = Rect::from_center_size(Pos2::new(x.clamp(g.left() + 20.0, g.right() - 20.0), y), Vec2::new(38.0, 15.0));
                                         painter.rect_filled(tr, CornerRadius::same(8), ROSE.gamma_multiply(0.92 * fade(x)));
-                                        painter.text(tr.center(), Align2::CENTER_CENTER, format!("-{:.1}", v), mono(9.0), Color32::from_rgb(0x22, 0x0a, 0x14).gamma_multiply(fade(x)));
+                                        painter.text(tr.center(), Align2::CENTER_CENTER, format!("-{:.1}", v), mono(9.0), Color32::from_rgb(20, 10, 14).gamma_multiply(fade(x)));
                                         last_x = x;
                                     }
                                 }
@@ -1007,7 +877,7 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
                         let lr = Rect::from_min_max(Pos2::new(dr.left() + 4.0, cy - 7.0), Pos2::new(g.left() - 2.0, cy + 7.0));
                         let resp = ui.allocate_rect(lr, Sense::hover());
                         painter.rect_filled(lr, CornerRadius::same(7), ROSE);
-                        painter.text(lr.center(), Align2::CENTER_CENTER, format!("{:.1}", ceil_db), mono(9.0), Color32::from_rgb(0x22, 0x0a, 0x14));
+                        painter.text(lr.center(), Align2::CENTER_CENTER, format!("{:.1}", ceil_db), mono(9.0), Color32::from_rgb(20, 10, 14));
                         resp.on_hover_text(ceil_txt);
                     }
                     // display mode + scale selectors on the display
@@ -1021,7 +891,7 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
                     // legend under the graph, aligned with it; latency at the right
                     let ly = dr.bottom() - 14.0;
                     let mut lx = dr.left() + 46.0;
-                    for (name, c) in [("in", Color32::from_rgb(0x9a, 0x6c, 0xb4)), ("out", Color32::from_rgb(0xd2, 0xb6, 0xe2)), ("gain reduction", ROSE), ("loudness", AMBER)] {
+                    for (name, c) in [("in", Color32::from_rgb(78, 92, 118)), ("out", Color32::from_rgb(150, 172, 210)), ("gain reduction", ROSE), ("loudness", AMBER)] {
                         painter.circle_filled(Pos2::new(lx + 3.5, ly), 3.5, c);
                         let tr = painter.text(Pos2::new(lx + 11.0, ly), Align2::LEFT_CENTER, name, mono(9.0), DIM);
                         lx = tr.right() + 16.0;
@@ -1054,7 +924,6 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
                 for (r, label, val, col) in [(r_pk, if ui_set.tp_meter { "PEAK dBTP" } else { "PEAK dB" }, dbs(max_pk), pk_col), (r_gr, "GR dB", gr_txt(max_gr), ROSE)] {
                     let resp = ui.allocate_rect(r, Sense::click()).on_hover_text("Click to reset");
                     painter.rect_filled(r, CornerRadius::same(12), Color32::from_black_alpha(if resp.hovered() { 40 } else { 70 }));
-                    specular_rim(&painter, r, 12.0, 0.45);
                     painter.text(Pos2::new(r.center().x, r.top() + 9.0), Align2::CENTER_CENTER, label, mono(8.5), DIM);
                     painter.text(Pos2::new(r.center().x, r.top() + 23.0), Align2::CENTER_CENTER, val, mono(13.0), col);
                     if resp.clicked() {
@@ -1225,7 +1094,7 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
                 let br = rect(14.0, by, BASE_W - 28.0, bh);
                 glass(&painter, br, false);
                 // style
-                painter.text(at(28.0, by + 14.0), Align2::LEFT_CENTER, "STYLE", mono(9.0), LILAC);
+                painter.text(at(28.0, by + 14.0), Align2::LEFT_CENTER, "STYLE", mono(9.0), DIM);
                 let style = p.style.value();
                 if let Some(nv) = enum_combo::<StyleParam>(ui, "style", rect(26.0, by + 26.0, 138.0, 22.0), style, style.name()) {
                     set_e(setter, &p.style, nv);
@@ -1263,7 +1132,7 @@ pub fn create(params: Arc<LimitParams>, meters: Arc<Meters>) -> Option<Box<dyn E
                     // centred in the gaps
                     painter.vline(o.x + kx + 38.0, (o.y + by + 14.0)..=(o.y + by + bh - 14.0), Stroke::new(1.0_f32, Color32::from_white_alpha(12)));
                     kx += 76.0;
-                    painter.text(at(kx + 38.0, by + 12.0), Align2::CENTER_CENTER, "CHANNEL LINK", mono(8.5), LILAC);
+                    painter.text(at(kx + 38.0, by + 12.0), Align2::CENTER_CENTER, "CHANNEL LINK", mono(8.5), DIM);
                     knob(ui, setter, &p.link_transient, "TRANSIENTS", "lt", at(kx, ky), 22.0, "Linking of the transient stage (short peaks): often best below 100 %.", false);
                     kx += 76.0;
                     knob(ui, setter, &p.link_release, "RELEASE", "lr", at(kx, ky), 22.0, "Linking of the release stage: 100 % keeps the stereo image steady.", false);
